@@ -1,36 +1,57 @@
 name: collect
 on:
   schedule:
-    - cron: "3-59/10 * * * *"
+    - cron: "3-59/10 * * * *"   # backup only: the loop below is the primary driver
   workflow_dispatch:
 permissions:
   contents: write
+  actions: write
 concurrency:
   group: collect
   cancel-in-progress: false
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 358
     steps:
       - uses: actions/checkout@v4
-      - name: Collect
-        id: collect
-        run: python3 collect.py data
-        continue-on-error: true
-      - name: Commit and push
+      - name: Collect every 10 min for 5h50m, push after each collection
         run: |
           git config user.name "attention-log[bot]"
           git config user.email "actions@users.noreply.github.com"
-          git add data
-          git diff --cached --quiet && exit 0
-          git commit -m "data $(date -u +%Y-%m-%dT%H:%MZ)"
-          for i in 1 2 3 4 5; do
-            git push && exit 0
-            git pull --rebase -X theirs || git rebase --abort
-            sleep $((i*3))
+
+          push_data() {
+            git add data
+            if git diff --cached --quiet; then return 0; fi
+            git commit -qm "data $(date -u +%Y-%m-%dT%H:%MZ)"
+            for i in 1 2 3 4 5; do
+              if git push -q; then return 0; fi
+              git pull -q --rebase -X theirs || git rebase --abort
+              sleep $((i*3))
+            done
+            echo "::warning::push failed after 5 tries"
+            return 1
+          }
+
+          START=$(date +%s)
+          END=$((START + 21000))   # 5h50m
+          n=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            TICK=$((START + n*600))
+            now=$(date +%s)
+            if [ "$TICK" -gt "$now" ]; then sleep $((TICK - now)); fi
+            if [ "$(date +%s)" -ge "$END" ]; then break; fi
+            echo "::group::collection #$n at $(date -u +%H:%M:%S)"
+            python3 collect.py data || echo "collect.py exit $?"
+            push_data || true
+            echo "::endgroup::"
+            now=$(date +%s)
+            n=$(( (now - START) / 600 + 1 ))   # skip ticks missed while running
           done
-          exit 1
-      - name: Fail if every source failed
-        if: steps.collect.outcome == 'failure'
-        run: exit 1
+          now=$(date +%s)
+          if [ "$END" -gt "$now" ]; then sleep $((END - now)); fi
+      - name: Start the next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run collect.yml -R "${{ github.repository }}" --ref "${{ github.ref_name }}"
