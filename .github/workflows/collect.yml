@@ -1,0 +1,36 @@
+name: collect
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: collect
+  cancel-in-progress: false
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect
+        id: collect
+        run: python3 collect.py data
+        continue-on-error: true
+      - name: Commit and push
+        run: |
+          git config user.name "attention-log[bot]"
+          git config user.email "actions@users.noreply.github.com"
+          git add data
+          git diff --cached --quiet && exit 0
+          git commit -m "data $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase -X theirs || git rebase --abort
+            sleep $((i*3))
+          done
+          exit 1
+      - name: Fail if every source failed
+        if: steps.collect.outcome == 'failure'
+        run: exit 1
