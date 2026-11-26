@@ -129,6 +129,70 @@ def normalize(src, data):
     return norm_cg(data)
 
 
+def iso_ms(ms):
+    try:
+        return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ms else None
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def main_pair(pairs, chain, addr):
+    """Main pair = highest liquidity.usd among pairs where the token is the base token."""
+    same = (lambda x: x == addr) if chain == "solana" else (lambda x: (x or "").lower() == addr.lower())
+    mine = [p for p in pairs if same((p.get("baseToken") or {}).get("address"))]
+    if not mine:
+        return None, 0
+    return max(mine, key=lambda p: num((p.get("liquidity") or {}).get("usd")) or 0), len(mine)
+
+
+def enrich_row(chain, addr, pairs):
+    p, n = main_pair(pairs, chain, addr)
+    r = {"r": None, "c": chain, "a": addr, "np": n}
+    if p:
+        v, tx, liq = p.get("volume") or {}, p.get("txns") or {}, p.get("liquidity") or {}
+        r.update({
+            "pool": p.get("pairAddress"), "dex": p.get("dexId"), "sym": (p.get("baseToken") or {}).get("symbol"),
+            "quote": (p.get("quoteToken") or {}).get("symbol"),
+            "px": num(p.get("priceUsd"), None), "liq": num(liq.get("usd")),
+            "mcap": num(p.get("marketCap")), "fdv": num(p.get("fdv")),
+            "vol_m5": num(v.get("m5")), "vol_h1": num(v.get("h1")), "vol_h24": num(v.get("h24")),
+            "buys_m5": (tx.get("m5") or {}).get("buys"), "sells_m5": (tx.get("m5") or {}).get("sells"),
+            "buys_h1": (tx.get("h1") or {}).get("buys"), "sells_h1": (tx.get("h1") or {}).get("sells"),
+            "created": iso_ms(p.get("pairCreatedAt")),
+        })
+    r.pop("r")
+    return r
+
+
+def enrich(lines):
+    """Unique (chain, address) of the 5 DexScreener endpoints -> /tokens/v1/{chain}/{a,b,...} (max 30, 300 rpm)."""
+    uniq = {}
+    for l in lines:
+        if l["s"].startswith("ds_") and l.get("c") and l.get("a"):
+            uniq.setdefault(l["c"], {})[l["a"]] = 1
+    out, meta = [], []
+    for chain, addrs in uniq.items():
+        addrs = list(addrs)
+        for i in range(0, len(addrs), 30):
+            batch = addrs[i:i + 30]
+            time.sleep(0.4)
+            s0 = time.time()
+            data, status, attempts, err = fetch(f"{DS}/tokens/v1/{chain}/{','.join(batch)}")
+            m = {"src": f"ds_tokens:{chain}", "status": status, "n": len(batch), "tries": attempts,
+                 "ms": int((time.time() - s0) * 1000)}
+            if err:
+                m["err"] = err
+            else:
+                by = {}
+                for pr in data if isinstance(data, list) else []:
+                    by.setdefault(((pr.get("baseToken") or {}).get("address") or "").lower(), []).append(pr)
+                for a in batch:
+                    out.append(enrich_row(chain, a, by.get(a.lower(), [])))
+            meta.append(m)
+            print(json.dumps(m), flush=True)
+    return out, meta
+
+
 def main():
     out_dir = sys.argv[1] if len(sys.argv) > 1 else "data"
     os.makedirs(out_dir, exist_ok=True)
@@ -148,8 +212,12 @@ def main():
             m["err"] = err
         meta.append(m)
         print(json.dumps(m), flush=True)
+    erows, emeta = enrich(lines)
+    for r in erows:
+        lines.append({"t": ts, "s": "ds_enrich", **{k: v for k, v in r.items() if v is not None}})
     n_rows = len(lines)
-    lines.append({"t": ts, "s": "_run", "ok": ok, "of": len(SOURCES), "calls": meta})
+    lines.append({"t": ts, "s": "_run", "ok": ok, "of": len(SOURCES),
+                  "enr_ok": sum("err" not in m for m in emeta), "enr_of": len(emeta), "calls": meta + emeta})
     path = os.path.join(out_dir, t0.strftime("%Y-%m-%d") + ".jsonl.gz")
     payload = ("\n".join(json.dumps(l, separators=(",", ":"), ensure_ascii=False) for l in lines) + "\n").encode("utf-8")
     with gzip.GzipFile(path, "ab", compresslevel=9) as f:  # 'ab' = new member appended
